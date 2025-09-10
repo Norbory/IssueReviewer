@@ -3,8 +3,8 @@ mod ai;
 mod utils;
 
 use utils::{get_bitbucket_token, get_bitbucket_user};
-use bitbucket::{fetch_issues, create_branch, get_latest_commit};
-use ai::{generate_branch_name};
+use bitbucket::{fetch_issues, create_branch, get_latest_commit, commit_file, branch_exists};
+use ai::{generate_branch_name, generate_fix_code};
 
 use reqwest::Client;
 
@@ -17,33 +17,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Obtenemos el último commit de la rama base (main)
     let base_commit = get_latest_commit(&client, &token, repo, &user).await?;
-        println!("Último commit en la rama base: {}", base_commit);
+    println!("Último commit en la rama base: {}", base_commit);
 
+    // Obtenemos issues del repo
     match fetch_issues(&client, &token, repo, &user).await {
         Ok(issues) => {
             if issues.is_empty() {
                 println!("No hay issues en el repositorio");
             } else {
                 for issue in issues {
-                    println!("Issue: {:?}", issue);
-
-                    // Generamos el nombre de la rama con IA
+                    // Nombre de rama por IA
                     match generate_branch_name(&issue.id.to_string(), &issue.title).await {
                         Ok(branch) => {
-                            // Ahora usamos el base_commit en create_branch
-                            if let Err(err) = create_branch(&client, &token, repo, &user, &branch, &base_commit).await {
-                                println!("Error creando rama para issue {}: {}", issue.id, err);
+                            // Si la rama no existe, crearla
+                            if branch_exists(&client, &token, repo, &user, &branch).await? {
+                                println!("La rama '{}' ya existe, se harán commits en ella", branch);
                             } else {
-                                println!("Rama '{}' creada para el issue {}", branch, issue.id);
+                                println!("Creando rama '{}' para issue {}", branch, issue.id);
+                                if let Err(err) = create_branch(&client, &token, repo, &user, &branch, &base_commit).await {
+                                    println!("Error creando rama para issue {}: {}", issue.id, err);
+                                    continue;
+                                }
                             }
-                        },
-                        Err(err) => println!("Error generando rama para issue {}: {}", issue.id, err),
+
+                            // --- GENERAR CÓDIGO con IA ---
+                            let language = std::env::var("DEFAULT_LANG")
+                                .unwrap_or_else(|_| "javascript".to_string());
+
+                            match generate_fix_code(&issue.id.to_string(), &issue.title, &issue.content.raw, &language).await {
+                                Ok((file_path, code)) => {
+                                    println!("Código generado. Archivo: {}", file_path);
+
+                                    // --- HACER COMMIT en la rama ---
+                                    match commit_file(&client, &token, repo, &user, &branch, &file_path, &code).await {
+                                        Ok(_) => println!("✅ Commit realizado correctamente en '{}' (rama {})", file_path, branch),
+                                        Err(e) => println!("❌ Error al commitear el archivo {}: {}", file_path, e),
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("❌ Error generando código para issue {}: {}", issue.id, e);
+                                }
+                            }
+                        }
+                        Err(err) => println!("❌ Error generando nombre de rama para issue {}: {}", issue.id, err),
                     }
                 }
             }
         }
-        Err(err) => println!("Error: {}", err),
+        Err(err) => println!("❌ Error al obtener issues: {}", err),
     }
-
     Ok(())
 }
